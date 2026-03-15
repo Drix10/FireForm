@@ -2,7 +2,7 @@ import os
 from typing import Union
 from commonforms import prepare_form 
 from pypdf import PdfReader
-from controller import Controller
+from .controller import Controller
 
 def input_fields(num_fields: int):
     fields = []
