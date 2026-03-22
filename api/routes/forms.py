@@ -30,12 +30,12 @@ def fill_form(form: FormFill, db: Session = Depends(get_db)):
             logger.error(f"Template not found: {form.template_id}")
             raise HTTPException(status_code=404, detail="Template not found")
 
-        # Validate template has required fields
+        # Check template has required fields
         if not fetched_template.fields:
             logger.error(f"Template {form.template_id} has no fields defined")
             raise HTTPException(status_code=400, detail="Template has no fields defined")
 
-        # Validate PDF file exists
+        # Check PDF file exists
         if not os.path.exists(fetched_template.pdf_path):
             logger.error(f"PDF template file not found: {fetched_template.pdf_path}")
             raise HTTPException(status_code=404, detail="PDF template file not found")
@@ -74,7 +74,7 @@ def fill_form(form: FormFill, db: Session = Depends(get_db)):
         except Exception as e:
             logger.error(f"Database operation failed: {e}", exc_info=True)
             
-            # Clean up generated PDF file on database failure
+            # Remove generated PDF file on database failure
             if generated_pdf_path and os.path.exists(generated_pdf_path):
                 try:
                     os.remove(generated_pdf_path)
@@ -89,13 +89,13 @@ def fill_form(form: FormFill, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Unexpected error in form filling: {e}", exc_info=True)
         
-        # Clean up any generated files on unexpected errors
+        # Remove any generated files on unexpected errors
         if generated_pdf_path and os.path.exists(generated_pdf_path):
             try:
                 os.remove(generated_pdf_path)
                 logger.info(f"Cleaned up PDF file after unexpected error: {generated_pdf_path}")
-            except OSError:
-                pass
+            except OSError as cleanup_error:
+                logger.warning(f"Failed to clean up PDF file {generated_pdf_path}: {cleanup_error}")
                 
         raise HTTPException(status_code=500, detail="Internal server error")
 

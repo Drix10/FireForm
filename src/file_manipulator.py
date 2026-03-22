@@ -3,6 +3,7 @@ from src.filler import Filler
 from src.llm import LLM
 from commonforms import prepare_form
 import logging
+from pathlib import Path
 
 # Only configure logging if not already configured
 logger = logging.getLogger(__name__)
@@ -23,16 +24,16 @@ class FileManipulator:
         """
         By using commonforms, we create an editable .pdf template and we store it.
         """
-        template_path = pdf_path[:-4] + "_template.pdf"
+        template_path = Path(pdf_path).parent / f"{Path(pdf_path).stem}_template.pdf"
         prepare_form(pdf_path, template_path)
-        return template_path
+        return str(template_path)
 
     def fill_form(self, user_input: str, fields: list, pdf_form_path: str):
         """
         It receives the raw data, runs the PDF filling logic,
         and returns the path to the newly created file.
         """
-        # Validate inputs
+        # Input validation
         if user_input is None:
             raise ValueError("User input cannot be None")
         if fields is None:
@@ -61,22 +62,35 @@ class FileManipulator:
             logger.error(f"PDF template not found at {pdf_form_path}")
             raise FileNotFoundError(f"PDF template not found at {pdf_form_path}")
 
-        # Validate PDF file
+        # Check PDF file extension
         if not pdf_form_path.lower().endswith('.pdf'):
             raise ValueError("File must be a PDF")
 
         logger.info("Starting extraction and PDF filling process")
         try:
-            # Create new LLM instance with proper constructor parameters
-            llm = LLM(transcript_text=user_input, target_fields=fields)
+            # Check file size (prevent memory exhaustion)
+            file_size = os.path.getsize(pdf_form_path)
+            if file_size > 100 * 1024 * 1024:  # 100MB limit
+                raise ValueError("PDF file too large (max 100MB)")
             
-            output_name = self.filler.fill_form(pdf_form=pdf_form_path, llm=llm)
+            # Check file permissions
+            if not os.access(pdf_form_path, os.R_OK):
+                raise PermissionError("Cannot read PDF file")
+            
+            # Use existing LLM instance with updated parameters
+            self.llm._transcript_text = user_input
+            self.llm._target_fields = fields
+            
+            output_name = self.filler.fill_form(pdf_form=pdf_form_path, llm=self.llm)
 
             logger.info("Process completed successfully")
             logger.info(f"Output saved to: {output_name}")
 
             return output_name
 
+        except (ValueError, RuntimeError, OSError, PermissionError) as e:
+            logger.error(f"PDF generation failed: {e}", exc_info=True)
+            raise ValueError("PDF generation failed") from e
         except Exception as e:
-            logger.error(f"Error occurred during PDF generation: {e}")
-            raise e
+            logger.error(f"Unexpected error during PDF generation: {e}", exc_info=True)
+            raise RuntimeError("PDF generation failed") from e

@@ -1,8 +1,12 @@
 import os
+import logging
 from typing import Union
 from commonforms import prepare_form 
 from pypdf import PdfReader
 from .controller import Controller
+
+# Set up logger
+logger = logging.getLogger(__name__)
 
 def input_fields(num_fields: int):
     fields = []
@@ -43,10 +47,15 @@ def run_pdf_fill_process(user_input: str, definitions: list, pdf_form_path: Unio
         
         return output_name
         
-    except Exception as e:
-        print(f"An error occurred during PDF generation: {e}")
+    except (ValueError, RuntimeError, OSError) as e:
+        logger.error(f"PDF generation failed: {e}", exc_info=True)
+        print("An error occurred during PDF generation")
         # Re-raise the exception so the frontend can handle it
-        raise e
+        raise ValueError("PDF generation failed") from e
+    except Exception as e:
+        logger.error(f"Unexpected error during PDF generation: {e}", exc_info=True)
+        print("An unexpected error occurred during PDF generation")
+        raise RuntimeError("PDF generation failed") from e
 
 
 if __name__ == "__main__":

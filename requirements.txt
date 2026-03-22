@@ -11,3 +11,5 @@ httpx==0.25.2
 numpy==1.26.2
 ollama==0.1.7
 python-dotenv==1.0.0
+bleach==6.1.0
+pypdf==3.0.1

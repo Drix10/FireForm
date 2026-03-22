@@ -3,6 +3,7 @@ import os
 import requests
 import logging
 import re
+import html
 
 # Compile regex patterns once for performance
 CONTROL_CHARS_PATTERN = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
@@ -19,16 +20,25 @@ DANGEROUS_PROMPT_PATTERNS = [
     re.compile(r'(?i)jailbreak'),
 ]
 
+# Script patterns for response sanitization
+SCRIPT_PATTERNS = [
+    re.compile(r'javascript:', re.IGNORECASE),
+    re.compile(r'data:', re.IGNORECASE),
+    re.compile(r'vbscript:', re.IGNORECASE),
+    re.compile(r'on\w+\s*=', re.IGNORECASE),
+]
+
 logger = logging.getLogger(__name__)
 
 
 class LLM:
     def __init__(self, transcript_text=None, target_fields=None, json=None):
+        import copy
         if json is None:
             json = {}
         self._transcript_text = transcript_text  # str
         self._target_fields = target_fields  # List or dict, contains the template fields
-        self._json = json.copy() if json else {}  # Create a copy to avoid shared state
+        self._json = copy.deepcopy(json) if json else {}  # Create a deep copy to avoid shared state
 
     def type_check_all(self):
         if type(self._transcript_text) is not str:
@@ -48,8 +58,8 @@ class LLM:
         @params: current_field -> represents the current element of the json that is being prompted.
         """
         # Sanitize inputs to prevent prompt injection
-        safe_field = self.sanitize_prompt_input(current_field)
-        safe_text = self.sanitize_prompt_input(self._transcript_text)
+        sanitized_field = self.sanitize_prompt_input(current_field)
+        sanitized_text = self.sanitize_prompt_input(self._transcript_text)
         
         prompt = f""" 
             SYSTEM PROMPT:
@@ -60,9 +70,9 @@ class LLM:
             If you don't identify the value in the provided text, return "-1".
             ---
             DATA:
-            Target JSON field to find in text: {safe_field}
+            Target JSON field to find in text: {sanitized_field}
             
-            TEXT: {safe_text}
+            TEXT: {sanitized_text}
             """
 
         return prompt
@@ -74,28 +84,159 @@ class LLM:
         if not isinstance(text, str):
             text = str(text)
         
-        # Limit length first to prevent ReDoS attacks
+        # Early length check
+        if len(text) > 10000:
+            logger.warning("Input text too long, truncating")
+            text = text[:10000] + "... [TRUNCATED]"
+        
+        # Store original for comparison
+        original_text = text
+        
+        # Normalization and decoding with limits
+        timer = None
+        timeout_occurred = [False]  # Use list for mutable reference
+        
+        try:
+            import unicodedata
+            import urllib.parse
+            import threading
+            import time
+            
+            def timeout_handler():
+                timeout_occurred[0] = True
+            
+            # Set timeout for processing using threading.Timer
+            timer = threading.Timer(2.0, timeout_handler)
+            timer.start()
+            start_time = time.time()
+            
+            try:
+                # Use NFC instead of NFKC to prevent compatibility attacks
+                text = unicodedata.normalize('NFC', text)
+                
+                # Check timeout periodically to avoid race conditions
+                if time.time() - start_time > 1.8 or timeout_occurred[0]:
+                    logger.warning("Processing timeout during normalization")
+                    return "User input has been sanitized for security reasons."
+                
+                # Check for suspicious expansion
+                if len(text) > len(original_text) * 2:
+                    logger.warning("Suspicious Unicode expansion detected")
+                    return "User input has been sanitized for security reasons."
+                
+                # Single URL decode only
+                decoded = urllib.parse.unquote(text)
+                if len(decoded) < len(text) * 0.5:  # Prevent excessive compression
+                    logger.warning("Suspicious URL encoding detected")
+                    return "User input has been sanitized for security reasons."
+                text = decoded
+                
+                # Check timeout again
+                if time.time() - start_time > 1.8 or timeout_occurred[0]:
+                    logger.warning("Processing timeout during URL decoding")
+                    return "User input has been sanitized for security reasons."
+                
+                # HTML unescape with caution
+                unescaped = html.unescape(text)
+                if len(unescaped) > len(text) * 3:  # Prevent entity expansion attacks
+                    logger.warning("Suspicious HTML entity expansion detected")
+                    return "User input has been sanitized for security reasons."
+                text = unescaped
+                
+                # Final timeout check
+                if time.time() - start_time > 1.8 or timeout_occurred[0]:
+                    logger.warning("Processing timeout during HTML unescaping")
+                    return "User input has been sanitized for security reasons."
+                    
+            except (ValueError, TypeError, AttributeError) as e:
+                # Check timeout before re-raising
+                if time.time() - start_time > 1.8 or timeout_occurred[0]:
+                    logger.warning("Processing timeout during exception handling")
+                    return "User input has been sanitized for security reasons."
+                logger.warning(f"Input processing error: {e}", exc_info=True)
+                raise ValueError("Input processing failed") from e
+            except Exception as e:
+                # Check timeout before re-raising
+                if time.time() - start_time > 1.8 or timeout_occurred[0]:
+                    logger.warning("Processing timeout during exception handling")
+                    return "User input has been sanitized for security reasons."
+                logger.error(f"Unexpected error during input processing: {e}", exc_info=True)
+                raise RuntimeError("Input processing failed") from e
+                
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning(f"Input normalization failed: {e}", exc_info=True)
+            # Continue with original text
+            text = original_text
+        except Exception as e:
+            logger.error(f"Unexpected error in input normalization: {e}", exc_info=True)
+            # Continue with original text
+            text = original_text
+        finally:
+            # Always cancel the timer to prevent resource leaks
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception as e:
+                    logger.debug(f"Failed to cancel timer: {e}")
+        
+        # Check for suspicious patterns
+        suspicious_found = False
+        
+        # Check original text
+        for pattern in DANGEROUS_PROMPT_PATTERNS:
+            if pattern.search(original_text):
+                suspicious_found = True
+                logger.warning("Suspicious pattern detected in input")
+                break
+        
+        # Check processed text
+        if not suspicious_found:
+            for pattern in DANGEROUS_PROMPT_PATTERNS:
+                if pattern.search(text):
+                    suspicious_found = True
+                    logger.warning("Suspicious pattern detected in processed input")
+                    break
+        
+        # Token/sequencing checks for instruction-like content
+        if not suspicious_found:
+            instruction_tokens = [
+                'ignore', 'forget', 'disregard', 'override', 'system:', 'assistant:', 
+                'user:', 'human:', 'new instructions', 'act as', 'pretend to be'
+            ]
+            
+            text_lower = text.lower()
+            for token in instruction_tokens:
+                if token in text_lower:
+                    suspicious_found = True
+                    logger.warning("Instruction-like content detected")
+                    break
+        
+        # Process suspicious content
+        if suspicious_found:
+            # Log the attempt for monitoring (without revealing content)
+            logger.warning("Potential prompt injection attempt blocked")
+            
+            # Return fallback for suspicious content
+            return "User input has been sanitized for security reasons."
+        
+        # Clean control characters
+        text = CONTROL_CHARS_PATTERN.sub('', text)
+        
+        # Final length check
         if len(text) > 5000:
             text = text[:5000] + "... [TRUNCATED]"
         
-        # Use pre-compiled patterns for performance
-        for pattern in DANGEROUS_PROMPT_PATTERNS:
-            text = pattern.sub('[FILTERED]', text)
-        
-        # Remove control characters
-        text = CONTROL_CHARS_PATTERN.sub('', text)
-        
-        return text
+        return text.strip()
 
     def main_loop(self):
-        # Validate inputs before processing
+        # Input validation
         if not self._target_fields:
             raise ValueError("No target fields specified")
         
         if not self._transcript_text:
             raise ValueError("No transcript text provided")
         
-        # Handle both dict and list formats for target_fields
+        # Support both dict and list formats for target_fields
         if isinstance(self._target_fields, list):
             # Convert list to dict for processing
             fields_dict = {field: field for field in self._target_fields}
@@ -104,65 +245,199 @@ class LLM:
         else:
             raise TypeError("target_fields must be a list or dictionary")
         
-        for field in fields_dict.keys():
-            prompt = self.build_prompt(field)
-            
+        # Limit number of fields to prevent resource exhaustion
+        if len(fields_dict) > 20:
+            logger.warning(f"Too many fields ({len(fields_dict)}), limiting to 20")
+            fields_dict = dict(list(fields_dict.items())[:20])
+        
+        # Use session for connection reuse and proper resource management
+        session = requests.Session()
+        
+        # Configure session with proper limits
+        session.headers.update({
+            'User-Agent': 'FireForm/1.0',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        })
+        
+        # Set connection pool limits to prevent resource exhaustion
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=0
+        )
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        
+        processed_fields = 0
+        max_fields_per_session = 10  # Prevent excessive API calls
+        
+        try:
             ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
             ollama_model = os.getenv("OLLAMA_MODEL", "mistral")
             ollama_url = f"{ollama_host}/api/generate"
+            
+            # Check Ollama URL format
+            if not ollama_url.startswith(('http://', 'https://')):
+                raise ValueError("Invalid Ollama URL format")
 
-            payload = {
-                "model": ollama_model,
-                "prompt": prompt,
-                "stream": False,
-            }
+            for field in fields_dict.keys():
+                if processed_fields >= max_fields_per_session:
+                    logger.warning(f"Reached maximum fields per session: {max_fields_per_session}")
+                    break
+                
+                prompt = self.build_prompt(field)
+                
+                # Check prompt length
+                if len(prompt) > 50000:  # 50KB limit
+                    logger.error(f"Prompt too long for field '{field}', skipping")
+                    self.add_response_to_json(field, "-1")
+                    continue
+                
+                payload = {
+                    "model": ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                }
 
-            response = None
-            try:
-                response = requests.post(ollama_url, json=payload, timeout=30)
-                response.raise_for_status()
-                
-                # Parse response
-                json_data = response.json()
-                
-                # Validate response structure
-                if "response" not in json_data:
-                    logger.error(f"Invalid response format from Ollama: {json_data}")
-                    parsed_response = "-1"
-                else:
-                    parsed_response = json_data["response"]
-                
-                logger.debug(f"Ollama response for field '{field}': {parsed_response}")
-                self.add_response_to_json(field, parsed_response)
-                
-            except requests.exceptions.ConnectionError:
-                logger.error(f"Could not connect to Ollama at {ollama_url}")
-                raise ConnectionError(
-                    f"Could not connect to Ollama at {ollama_url}. "
-                    "Please ensure Ollama is running and accessible."
-                )
-            except requests.exceptions.HTTPError as e:
-                logger.error(f"Ollama returned an error: {e}")
-                raise RuntimeError(f"Ollama returned an error: {e}")
-            except requests.exceptions.Timeout:
-                logger.error(f"Ollama request timed out after 30 seconds")
-                raise RuntimeError("Ollama request timed out")
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error: {e}")
-                raise RuntimeError(f"Request failed: {e}")
-            except (ValueError, KeyError) as e:
-                logger.error(f"Error parsing Ollama response: {e}")
-                # Continue with next field instead of failing completely
-                self.add_response_to_json(field, "-1")
-            finally:
-                # Ensure response is properly closed to prevent resource leaks
-                if response is not None:
+                response = None
+                try:
+                    # Add request timeout and size limits
+                    response = session.post(
+                        ollama_url, 
+                        json=payload, 
+                        timeout=30,
+                        stream=False
+                    )
+                    response.raise_for_status()
+                    
+                    # Check response size before processing
+                    content_length = response.headers.get('content-length')
+                    if content_length:
+                        try:
+                            content_length = int(content_length)
+                            if content_length > 1024 * 1024:  # 1MB limit
+                                logger.error(f"Response too large ({content_length} bytes) for field '{field}', skipping")
+                                self.add_response_to_json(field, "-1")
+                                continue
+                        except (ValueError, TypeError):
+                            logger.warning("Invalid content-length header")
+                    
+                    # Read response with size limit to prevent memory exhaustion
                     try:
-                        response.close()
-                    except:
-                        pass
+                        response_text = response.text
+                        if len(response_text) > 1024 * 1024:  # 1MB limit on actual content
+                            logger.error(f"Response content too large ({len(response_text)} bytes) for field '{field}', skipping")
+                            self.add_response_to_json(field, "-1")
+                            continue
+                        
+                        if not response_text.strip():
+                            logger.warning(f"Empty response for field '{field}'")
+                            self.add_response_to_json(field, "-1")
+                            continue
+                        
+                        json_data = response.json()
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Failed to parse JSON response for field '{field}': {e}")
+                        self.add_response_to_json(field, "-1")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Unexpected error parsing response for field '{field}': {e}", exc_info=True)
+                        self.add_response_to_json(field, "-1")
+                        continue
+                    
+                    # Check response structure with error handling
+                    try:
+                        if not isinstance(json_data, dict):
+                            logger.error(f"Response is not a JSON object for field '{field}'")
+                            parsed_response = "-1"
+                        elif "response" not in json_data:
+                            logger.error(f"Invalid response format from Ollama - missing 'response' field for field '{field}'")
+                            parsed_response = "-1"
+                        else:
+                            parsed_response = json_data["response"]
+                            # Convert response to string for processing
+                            if parsed_response is None:
+                                parsed_response = ""
+                            elif not isinstance(parsed_response, (str, int, float, bool)):
+                                # Convert complex objects to string
+                                try:
+                                    parsed_response = str(parsed_response)
+                                except (ValueError, TypeError, AttributeError) as e:
+                                    logger.warning(f"Failed to convert response to string for field '{field}': {e}", exc_info=True)
+                                    parsed_response = "-1"
+                                except Exception as e:
+                                    logger.error(f"Unexpected error converting response to string for field '{field}': {e}", exc_info=True)
+                                    parsed_response = "-1"
+                            else:
+                                parsed_response = str(parsed_response)
+                            
+                            # Limit response size with proper bounds checking
+                            if len(parsed_response) > 10000:
+                                logger.warning(f"Response too long ({len(parsed_response)} chars) for field '{field}', truncating to 10000")
+                                parsed_response = parsed_response[:9997] + "..."  # Exactly 10000 chars
+                    
+                    except (ValueError, TypeError, AttributeError, KeyError) as e:
+                        logger.error(f"Error processing response structure for field '{field}': {e}", exc_info=True)
+                        parsed_response = "-1"
+                    except Exception as e:
+                        logger.error(f"Unexpected error processing response structure for field '{field}': {e}", exc_info=True)
+                        parsed_response = "-1"
+                    
+                    logger.debug(f"Ollama response for field '{field}': {parsed_response[:100]}...")
+                    self.add_response_to_json(field, parsed_response)
+                    processed_fields += 1
+                    
+                except requests.exceptions.ConnectionError as e:
+                    logger.error(f"Could not connect to Ollama at {ollama_url}: {e}")
+                    raise ConnectionError(
+                        f"Could not connect to Ollama at {ollama_url}. "
+                        "Please ensure Ollama is running and accessible."
+                    )
+                except requests.exceptions.HTTPError as e:
+                    logger.error(f"Ollama returned an error for field '{field}': {e}")
+                    # Continue with next field instead of failing completely
+                    self.add_response_to_json(field, "-1")
+                    continue
+                except requests.exceptions.Timeout as e:
+                    logger.error(f"Ollama request timed out after 30 seconds for field '{field}': {e}")
+                    # Continue with next field instead of failing completely
+                    self.add_response_to_json(field, "-1")
+                    continue
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request error for field '{field}': {e}")
+                    # Continue with next field instead of failing completely
+                    self.add_response_to_json(field, "-1")
+                    continue
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Error parsing Ollama response for field '{field}': {e}")
+                    # Continue with next field instead of failing completely
+                    self.add_response_to_json(field, "-1")
+                    continue
+                except Exception as e:
+                    logger.error(f"Unexpected error processing field '{field}': {e}", exc_info=True)
+                    # Continue with next field instead of failing completely
+                    self.add_response_to_json(field, "-1")
+                    continue
+                finally:
+                    # Close response to prevent resource leaks
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass  # Ignore cleanup errors
+        
+        except Exception as e:
+            logger.error(f"Critical error in main_loop: {e}", exc_info=True)
+            raise RuntimeError("LLM processing failed") from e
+        finally:
+            # Always close the session to prevent connection leaks
+            try:
+                session.close()
+            except Exception:
+                pass  # Ignore cleanup errors
 
-        logger.info("LLM extraction completed")
+        logger.info(f"LLM extraction completed - processed {processed_fields} fields")
         logger.debug(f"Extracted data: {json.dumps(self._json, indent=2)}")
 
         return self
@@ -213,23 +488,49 @@ class LLM:
         """
         Sanitize AI response to prevent injection and ensure data quality
         """
-        if not isinstance(value, str):
-            return str(value)
+        if value is None:
+            return "-1"
         
-        # Limit length first to prevent ReDoS
+        if not isinstance(value, str):
+            value = str(value)
+        
+        # Limit length first to prevent ReDoS and memory issues
         if len(value) > 1000:
             logger.warning(f"Response truncated from {len(value)} to 1000 characters")
-            value = value[:1000]
+            value = value[:997] + "..."  # Exactly 1000 chars
         
-        # Use pre-compiled patterns for performance
-        # Remove quotes and whitespace
-        value = value.strip().replace('"', "")
+        # Unicode normalization to prevent normalization attacks
+        try:
+            import unicodedata
+            value = unicodedata.normalize('NFKC', value)
+        except Exception:
+            logger.warning("Unicode normalization failed, using original value")
         
-        # Remove control characters
+        # Remove quotes and excessive whitespace
+        value = value.strip().replace('"', "").replace("'", "")
+        
+        # Remove control characters (including Unicode control chars)
         value = CONTROL_CHARS_PATTERN.sub('', value)
         
-        # Remove potential script tags or HTML (non-greedy pattern)
+        # Remove potential HTML tags (non-greedy pattern)
         value = HTML_TAGS_PATTERN.sub('', value)
+        
+        # Check for prompt injection patterns
+        for pattern in DANGEROUS_PROMPT_PATTERNS:
+            if pattern.search(value):
+                logger.warning(f"Potential prompt injection detected in response: {value[:50]}...")
+                return "-1"
+        
+        # Remove potential script content
+        for pattern in SCRIPT_PATTERNS:
+            value = pattern.sub('', value)
+        
+        # Final cleanup
+        value = value.strip()
+        
+        # Return default if empty after sanitization
+        if not value:
+            return "-1"
         
         return value
 
