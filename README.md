@@ -116,8 +116,6 @@ FireForm implements enterprise-grade security:
 - SQL injection prevention
 - Comprehensive error handling
 
-See `ALL_SECURITY_FIXES_IMPLEMENTED.md` for detailed security documentation.
-
 ## 🤝 Code of Conduct
 
 We are committed to providing a friendly, safe, and welcoming environment for all. Please see our [Code of Conduct](CODE_OF_CONDUCT.md) for more information.
