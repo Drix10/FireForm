@@ -31,7 +31,7 @@ class FileManipulator:
     def fill_form(self, user_input: str, fields: list, pdf_form_path: str):
         """
         It receives the raw data, runs the PDF filling logic,
-        and returns the path to the newly created file.
+        and returns the path to the newly created file and a review flag.
         """
         # Input validation
         if user_input is None:
@@ -54,13 +54,31 @@ class FileManipulator:
             raise ValueError("Fields cannot be empty")
         if not pdf_form_path.strip():
             raise ValueError("PDF form path cannot be empty")
+        
+        # Path traversal validation
+        import re
+        path_traversal_pattern = re.compile(r'(?:\.\.[\\/]|\.\.%2[fF]|\.\.%5[cC])')
+        if path_traversal_pattern.search(pdf_form_path):
+            raise ValueError("Path traversal detected in PDF path")
+        
+        # Normalize path and check it's within allowed directory
+        from pathlib import Path
+        try:
+            pdf_path_obj = Path(pdf_form_path).resolve()
+        except (ValueError, OSError) as e:
+            raise ValueError(f"Invalid PDF path: {e}")
+        
+        # Check if file exists
+        if not pdf_path_obj.exists():
+            logger.error(f"PDF template not found at {pdf_form_path}")
+            raise FileNotFoundError(f"PDF template not found at {pdf_form_path}")
+        
+        # Check it's a file, not a directory
+        if not pdf_path_obj.is_file():
+            raise ValueError("PDF path must be a file, not a directory")
 
         logger.info("Received request from frontend")
         logger.info(f"PDF template path: {pdf_form_path}")
-
-        if not os.path.exists(pdf_form_path):
-            logger.error(f"PDF template not found at {pdf_form_path}")
-            raise FileNotFoundError(f"PDF template not found at {pdf_form_path}")
 
         # Check PDF file extension
         if not pdf_form_path.lower().endswith('.pdf'):
@@ -81,12 +99,62 @@ class FileManipulator:
             self.llm._transcript_text = user_input
             self.llm._target_fields = fields
             
-            output_name = self.filler.fill_form(pdf_form=pdf_form_path, llm=self.llm)
+            # Try structured extraction first, fallback to old method
+            logger.info("Attempting structured extraction...")
+            extraction_success = False
+            
+            try:
+                extraction_success = self.llm.extract_structured_safe()
+            except Exception as e:
+                logger.warning(f"Structured extraction raised exception: {e}", exc_info=True)
+                extraction_success = False
+            
+            if not extraction_success:
+                logger.info("Structured extraction failed, falling back to field-by-field extraction")
+                try:
+                    self.llm.main_loop()
+                except Exception as e:
+                    logger.error(f"Field-by-field extraction also failed: {e}", exc_info=True)
+                    raise RuntimeError("Both extraction methods failed") from e
+            
+            # Verify we have extracted data
+            extracted_data = self.llm.get_data()
+            if not extracted_data or not isinstance(extracted_data, dict):
+                raise ValueError("No data extracted from input")
+            
+            # Fill the PDF
+            try:
+                output_name = self.filler.fill_form(pdf_form=pdf_form_path, llm=self.llm)
+            except Exception as e:
+                logger.error(f"PDF filling failed: {e}", exc_info=True)
+                raise RuntimeError("PDF filling failed") from e
+            
+            if not output_name or not isinstance(output_name, str):
+                raise ValueError("PDF filling returned invalid output path")
+            
+            # Check if manual review is needed
+            try:
+                from src.utils.validation import requires_review
+                
+                # Get field keys
+                if isinstance(fields, list):
+                    field_keys = fields
+                elif isinstance(fields, dict):
+                    field_keys = list(fields.keys())
+                else:
+                    field_keys = []
+                
+                review_flag = requires_review(extracted_data, field_keys)
+            except Exception as e:
+                logger.warning(f"Review check failed: {e}", exc_info=True)
+                # Default to requiring review if check fails
+                review_flag = True
 
             logger.info("Process completed successfully")
             logger.info(f"Output saved to: {output_name}")
+            logger.info(f"Requires review: {review_flag}")
 
-            return output_name
+            return output_name, review_flag
 
         except (ValueError, RuntimeError, OSError, PermissionError) as e:
             logger.error(f"PDF generation failed: {e}", exc_info=True)

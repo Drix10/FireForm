@@ -34,6 +34,11 @@ def fill_form(form: FormFill, db: Session = Depends(get_db)):
         if not fetched_template.fields:
             logger.error(f"Template {form.template_id} has no fields defined")
             raise HTTPException(status_code=400, detail="Template has no fields defined")
+        
+        # Validate fields type
+        if not isinstance(fetched_template.fields, (dict, list)):
+            logger.error(f"Template {form.template_id} has invalid fields type: {type(fetched_template.fields)}")
+            raise HTTPException(status_code=500, detail="Template has invalid fields configuration")
 
         # Check PDF file exists
         if not os.path.exists(fetched_template.pdf_path):
@@ -44,11 +49,15 @@ def fill_form(form: FormFill, db: Session = Depends(get_db)):
         controller = Controller()
         
         try:
-            generated_pdf_path = controller.fill_form(
+            generated_pdf_path, requires_review = controller.fill_form(
                 user_input=form.input_text, 
                 fields=fetched_template.fields, 
                 pdf_form_path=fetched_template.pdf_path
             )
+            
+            if not generated_pdf_path:
+                raise AppError("PDF generation failed", status_code=400)
+                
         except FileNotFoundError as e:
             logger.error(f"PDF template file not found: {e}", exc_info=True)
             raise HTTPException(status_code=404, detail="PDF template file not found")
@@ -64,11 +73,12 @@ def fill_form(form: FormFill, db: Session = Depends(get_db)):
             submission = FormSubmission(
                 template_id=form.template_id,
                 input_text=form.input_text,
-                output_pdf_path=generated_pdf_path
+                output_pdf_path=generated_pdf_path,
+                requires_review=requires_review
             )
             result = create_form(db, submission)
             
-            logger.info(f"Form filled successfully: {result.id}")
+            logger.info(f"Form filled successfully: {result.id}, requires_review: {requires_review}")
             return result
             
         except Exception as e:

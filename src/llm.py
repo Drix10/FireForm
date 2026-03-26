@@ -50,18 +50,6 @@ class LLM:
         self._target_fields = target_fields  # List or dict, contains the template fields
         self._json = copy.deepcopy(json) if json else {}  # Create a deep copy to avoid shared state
 
-    def type_check_all(self):
-        if type(self._transcript_text) is not str:
-            raise TypeError(
-                f"ERROR in LLM() attributes ->\
-                Transcript must be text. Input:\n\ttranscript_text: {self._transcript_text}"
-            )
-        elif type(self._target_fields) is not list:
-            raise TypeError(
-                f"ERROR in LLM() attributes ->\
-                Target fields must be a list. Input:\n\ttarget_fields: {self._target_fields}"
-            )
-
     def build_prompt(self, current_field):
         """
         This method is in charge of the prompt engineering. It creates a specific prompt for each target field.
@@ -578,3 +566,256 @@ class LLM:
 
     def get_data(self):
         return self._json
+
+    def extract_structured(self):
+        """
+        Attempt structured JSON extraction in a single LLM call.
+        This is the new schema-driven approach that extracts all fields at once.
+        """
+        if not self._target_fields:
+            raise ValueError("No target fields specified")
+        
+        if not self._transcript_text:
+            raise ValueError("No transcript text provided")
+        
+        # Support both dict and list formats
+        if isinstance(self._target_fields, list):
+            schema_fields = self._target_fields
+        elif isinstance(self._target_fields, dict):
+            schema_fields = list(self._target_fields.keys())
+        else:
+            raise TypeError("target_fields must be a list or dictionary")
+        
+        # Limit number of fields
+        if len(schema_fields) > 20:
+            logger.warning(f"Too many fields ({len(schema_fields)}), limiting to 20")
+            schema_fields = schema_fields[:20]
+        
+        # Sanitize transcript
+        sanitized_text = self.sanitize_prompt_input(self._transcript_text)
+        
+        # Build structured extraction prompt
+        prompt = f"""Extract structured JSON for these fields: {schema_fields}
+
+Text: {sanitized_text}
+
+Return ONLY valid JSON with the exact field names provided. If a field value is not found, use "-1".
+Example format: {{"field1": "value1", "field2": "value2"}}
+
+JSON:"""
+        
+        # Check prompt length
+        if len(prompt) > 50000:
+            raise ValueError("Prompt too long for structured extraction")
+        
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        ollama_model = os.getenv("OLLAMA_MODEL", "mistral")
+        ollama_url = f"{ollama_host}/api/generate"
+        
+        # Check URL format
+        if not ollama_url.startswith(('http://', 'https://')):
+            raise ValueError("Invalid Ollama URL format")
+        
+        payload = {
+            "model": ollama_model,
+            "prompt": prompt,
+            "stream": False,
+        }
+        
+        response = None
+        session = None
+        try:
+            # Use session for proper resource management
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'FireForm/1.0',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            })
+            
+            response = session.post(ollama_url, json=payload, timeout=30)
+            response.raise_for_status()
+            
+            # Check response size
+            content_length = response.headers.get('content-length')
+            if content_length:
+                try:
+                    content_length = int(content_length)
+                    if content_length > 1024 * 1024:  # 1MB limit
+                        raise ValueError(f"Response too large: {content_length} bytes")
+                except (ValueError, TypeError) as e:
+                    if "Response too large" in str(e):
+                        raise
+                    logger.warning("Invalid content-length header")
+            
+            # Read response with size limit
+            response_text = response.text
+            if len(response_text) > 1024 * 1024:  # 1MB limit
+                raise ValueError(f"Response content too large: {len(response_text)} bytes")
+            
+            if not response_text.strip():
+                raise ValueError("Empty response from Ollama")
+            
+            json_data = response.json()
+            
+            if not isinstance(json_data, dict):
+                raise ValueError("Response is not a JSON object")
+            
+            if "response" not in json_data:
+                raise ValueError("Invalid response format - missing 'response' field")
+            
+            return json_data["response"]
+                    
+        except requests.exceptions.Timeout:
+            logger.error("Structured extraction timed out")
+            raise TimeoutError("Structured extraction timed out")
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Could not connect to Ollama: {e}")
+            raise ConnectionError(f"Could not connect to Ollama at {ollama_url}")
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Ollama returned an error: {e}")
+            raise RuntimeError(f"Ollama error: {e}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Validation error in structured extraction: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in structured extraction: {e}", exc_info=True)
+            raise RuntimeError(f"Structured extraction failed: {e}")
+        finally:
+            # Ensure resources are always cleaned up
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    def extract_structured_safe(self):
+        """
+        Safe wrapper for structured extraction with fallback to old method.
+        Returns True if structured extraction succeeded, False if fallback needed.
+        """
+        try:
+            logger.info("Attempting structured extraction...")
+            raw_response = self.extract_structured()
+            
+            # Validate response is not empty
+            if not raw_response or not raw_response.strip():
+                logger.warning("Empty response from structured extraction")
+                return False
+            
+            # Try to parse JSON response with multiple strategies
+            cleaned_response = raw_response.strip()
+            
+            # Strategy 1: Remove markdown code blocks
+            if "```json" in cleaned_response:
+                # Extract content between ```json and ```
+                start = cleaned_response.find("```json") + 7
+                end = cleaned_response.find("```", start)
+                if end > start:
+                    cleaned_response = cleaned_response[start:end].strip()
+            elif cleaned_response.startswith("```"):
+                # Remove generic code blocks
+                cleaned_response = cleaned_response[3:]
+                if cleaned_response.endswith("```"):
+                    cleaned_response = cleaned_response[:-3]
+                cleaned_response = cleaned_response.strip()
+            
+            # Strategy 2: Extract JSON object if embedded in text
+            if not cleaned_response.startswith("{"):
+                # Try to find JSON object in response
+                start_idx = cleaned_response.find("{")
+                end_idx = cleaned_response.rfind("}")
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    cleaned_response = cleaned_response[start_idx:end_idx+1]
+                else:
+                    logger.warning("No JSON object found in response")
+                    return False
+            
+            # Limit size before parsing
+            if len(cleaned_response) > 100000:  # 100KB limit
+                logger.warning(f"Cleaned response too large: {len(cleaned_response)} bytes")
+                return False
+            
+            # Parse JSON
+            try:
+                parsed_data = json.loads(cleaned_response)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON: {e}")
+                logger.debug(f"Attempted to parse: {cleaned_response[:200]}...")
+                return False
+            
+            # Validate it's a dict
+            if not isinstance(parsed_data, dict):
+                logger.warning(f"Structured extraction returned {type(parsed_data)}, expected dict")
+                return False
+            
+            # Validate all required fields are present
+            if isinstance(self._target_fields, list):
+                required_fields = set(self._target_fields)
+            elif isinstance(self._target_fields, dict):
+                required_fields = set(self._target_fields.keys())
+            else:
+                required_fields = set()
+            
+            extracted_fields = set(parsed_data.keys())
+            missing_fields = required_fields - extracted_fields
+            
+            if missing_fields:
+                logger.warning(f"Missing fields in structured extraction: {missing_fields}")
+                # Add missing fields with default value
+                for field in missing_fields:
+                    parsed_data[field] = "-1"
+            
+            # Sanitize all values
+            sanitized_data = {}
+            for key, value in parsed_data.items():
+                # Only process fields we requested
+                if key in required_fields:
+                    if isinstance(value, str):
+                        sanitized_data[key] = self.sanitize_response(value)
+                    elif value is None:
+                        sanitized_data[key] = "-1"
+                    elif isinstance(value, (int, float, bool)):
+                        sanitized_data[key] = self.sanitize_response(str(value))
+                    elif isinstance(value, list):
+                        # Limit list size to prevent memory exhaustion
+                        if len(value) > 100:
+                            logger.warning(f"List too large for field '{key}': {len(value)} items, limiting to 100")
+                            value = value[:100]
+                        
+                        # Handle list values
+                        sanitized_list = []
+                        for item in value:
+                            if isinstance(item, str):
+                                sanitized_list.append(self.sanitize_response(item))
+                            else:
+                                sanitized_list.append(self.sanitize_response(str(item)))
+                        sanitized_data[key] = sanitized_list if sanitized_list else ["-1"]
+                    else:
+                        # Convert complex objects to string
+                        sanitized_data[key] = self.sanitize_response(str(value))
+            
+            # Verify all required fields are present
+            missing_required = required_fields - set(sanitized_data.keys())
+            if missing_required:
+                logger.warning(f"Missing required fields after sanitization: {missing_required}")
+                return False
+            
+            self._json = sanitized_data
+            logger.info(f"Structured extraction succeeded - extracted {len(sanitized_data)} fields")
+            return True
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse structured JSON: {e}")
+            return False
+        except (ValueError, TypeError, KeyError) as e:
+            logger.warning(f"Validation error in structured extraction: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"Structured extraction failed: {e}", exc_info=True)
+            return False
